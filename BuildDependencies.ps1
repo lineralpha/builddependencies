@@ -144,10 +144,11 @@ function Get-Reference
 
     if ($keyword) {
         Write-Debug "Filter references by keyword: $keyword"
-        $pattern = [System.Text.RegularExpressions.Regex]::Escape($keyword)
+        # $pattern = [System.Text.RegularExpressions.Regex]::Escape($keyword)
+        $pattern = "*$keyword*"
         $references = $references |
-            Where-Object { ($_.Include -and $_.Include -match $pattern) -or`
-                           ($_.HintPath -and $_.HintPath -match $pattern) }
+            Where-Object { ($_.Include -and $_.Include -like $pattern) -or`
+                           ($_.HintPath -and $_.HintPath -like $pattern) }
         Write-Debug "$($references.Count) references matching keyword:"
     }
 
