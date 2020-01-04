@@ -1,41 +1,65 @@
 <#
 .SYNOPSIS
-    Builds a project and all projects in its dependency tree through references.
+    Builds a project and all projects in its dependency tree through assembly references.
 
 .DESCRIPTION
-    Builds a project and all projects in its dependency tree through references.
+    This script builds the given project and all its dependency projects through
+    the assembly references in the project files.
 
-    This script parses the given project for all references that contain the
-    specified keyword. Then search in the source repository under the folder and
-    subfolders given by the base path for the projects producing the referenced assemblies.
+    It first parses the given project for all assembly references that match the
+    specified keyword; then searches in the source repository (or a subfolder
+    in the repository) speficied by the base path for projects producing the
+    referenced assemblies. It recursively repeats the above process for each of
+    the dependency projects until all referenced assemblies downward the dependency
+    tree are resolved, and a dependency list of projects is generated. Finally,
+    this script launches the build command to build the projects in the order of
+    the dependency list.
 
 .PARAMETER ProjectFile
-    The given project whose references are analyzed.
+    The given project whose assembly reference dependency tree is parsed and built.
 
 .PARAMETER BasePath
-    The path to the base folder in the source repository where search
-    starts (in this folder and recursively in subfolders).
+    The full path to the source repository, or subfolders where search for dependency
+    projects starts.
 
-.PARAMETER Restore
-    If specified, runs nuget package restore prior to building each project.
-
-.PARAMETER Resume
-    If present, resume the build run from where it stopped last time
+    Search happens in the BasePath folder and recursively its subfolders. If search
+    only needs to happen in portion of the source repository, BasePath can point
+    to the top folder of that portion. Multiple base paths can be specified if
+    search in multiple locations is of the interest.
 
 .PARAMETER Keyword
-    The keyword to search in the references. This is typically a keyword in the
-    path to the referenced assemblies. This serves to effectively exclude those
-    references that do not have producing projects in the source repository. For
-    example, the .NET assemblies System.* .
+    If present, the keyword is used to match the assembly references during the
+    search process.
 
-    If not specified, all references are searched.
+    This is typically a keyword in the path to the referenced assemblies. References
+    that do not match the keyword will be excluded from the search process, and
+    thus will not be added to the dependency tree. This effectively serves to
+    exclude those assembly references that do not have producing projects in the
+    source repository. For example, third-party assemblies or assemblies produced
+    from external repositories.
 
 .PARAMETER DryRun
-    Don't actually build the project and its dependencies, but just analyze and
-    list its dependency projects which would be built.
+    If present, this script doesn't actually build the project and its dependency
+    projects, but just analyzes and outputs its dependency projects which would
+    be built otherwise.
+
+.PARAMETER Resume
+    If present, this script resumes the build run from where it left last time
+    without needing to re-parse the dependency tree.
+
+    This can be useful and time-saving in the following two scenarios:
+    1. If DryRun is specified in a previous run, the dependency list is already
+       generated. Launching a new run with Resume specified will just pick up and
+       build the existing dependency list, without re-parsing the dependency tree.
+    2. If previous run failed and exited at a project, relaunching this script will
+       continue from the failed project after issue was resolved, without needing
+       to re-parse or rebuild the entire dependency tree.
+
+.PARAMETER Restore
+    If present, this script runs nuget package restore prior to building each project.
 
 .PARAMETER BuildArgs
-    [string] The arguments passed "as-is" to build tool.
+    If present, these are build arguments passed "as-is" to the build command.
 
 .INPUTS
     None.
@@ -44,31 +68,48 @@
     None.
 
 .EXAMPLE
-    BuildDependencies.ps1 myproject.csproj c:\repo\src\dev
+    BuildDependencies.ps1 myproject.csproj c:\repo\src\dev -Keyword critical
+
+    Build myproject.csproj in current location, search its dependency tree in
+    folder c:\repo\src\dev, and dependency references must match keyword "critical".
+
+.EXAMPLE
+    BuildDependencies.ps1 myproject.csproj c:\repo\src\dev -DryRun
+
+    Analyze but do not build myproject.csproj in current location, search its
+    dependency tree in folder c:\repo\src\dev.
+
+.EXAMPLE
+    BuildDependencies.ps1 myproject.csproj c:\repo\src\dev -Resume
+
+    Resume building myproject.csproj and its dependency tree from the point where
+    the previous build run stopped. This command will not re-parse the project's
+    dependency tree. Instead, it picks up and continues with whatever left from the
+    previous build run.
 
 .EXAMPLE
     BuildDependencies.ps1 myproject.csproj c:\repo\src\dev -Restore -BuildArgs "-c"
 
-.EXAMPLE
-    BuildDependencies.ps1 myproject.csproj c:\repo\src\dev -Restore -Keyword "dev"
+    Build myproject.csproj and its dependency tree. Run nuget restore before
+    launching build command, and launch build command with argument "-c".
 #>
 
 [CmdletBinding()]
 param (
     [parameter(Mandatory = $true, Position = 0)]
-    [string] $projectFile,
+    [string] $ProjectFile,
     [parameter(Mandatory = $true, Position = 1)]
-    [string[]] $basePath,
+    [string[]] $BasePath,
     [parameter(Mandatory = $false)]
-    [switch] $restore,
+    [string] $Keyword = $null,
     [parameter(Mandatory = $false)]
-    [switch] $dryRun,
+    [switch] $DryRun,
     [parameter(Mandatory = $false)]
-    [switch] $resume,
+    [switch] $Resume,
     [parameter(Mandatory = $false)]
-    [string] $keyword = $null,
+    [switch] $Restore,
     [parameter(Mandatory = $false)]
-    [string] $buildArgs = $null
+    [string] $BuildArgs = $null
 )
 
 
@@ -95,24 +136,28 @@ function Get-Reference
     #   1. use Include attribute to point to path-to-assembly; or
     #   2. use HintPath to point to path-to-assembly.
 
-    $projAsXml = (Select-Xml -Path $projectFile -XPath /).Node
+    [xml] $xml = (Select-Xml -Path $projectFile -XPath /).Node
     # this seems to exccessively return a Reference node for each ItemGroup
     # even though there isn't one. Filter null references
-    $references = $projAsXml.Project.ItemGroup.Reference |
+    $references = $xml.Project.ItemGroup.Reference |
         Where-Object { $_ -ne $null }
 
     if ($keyword) {
         Write-Debug "Filter references by keyword: $keyword"
+        $pattern = [System.Text.RegularExpressions.Regex]::Escape($keyword)
         $references = $references |
-            Where-Object { ($_.Include -and $_.Include.Contains($keyword)) -or`
-                           ($_.HintPath -and $_.HintPath.Contains($keyword)) }
+            Where-Object { ($_.Include -and $_.Include -match $pattern) -or`
+                           ($_.HintPath -and $_.HintPath -match $pattern) }
+        Write-Debug "$($references.Count) references matching keyword:"
     }
 
     foreach ($ref in $references) {
         if ($ref.HintPath) {
+            Write-Debug $ref.HintPath
             $referencePaths.Add($ref.HintPath)
         }
         elseif ($ref.Include) {
+            Write-Debug $ref.Include
             $referencePaths.Add($ref.Include)
         }
         else {
@@ -132,7 +177,7 @@ function Find-ProjectFile
     param (
         # assembly name
         [string] $assemblyName,
-        # target framework moniker of the assembly
+        # target framework of the assembly
         [string] $targetFramework,
         # collection of project files where to search for the producing project
         [System.IO.FileInfo[]] $projectFiles,
@@ -141,6 +186,7 @@ function Find-ProjectFile
     )
 
     Write-Debug "Looking for project producing: $assemblyName. TargetFramework: '$targetframework'"
+    $assemblyNameWithExtension = $assemblyName
 
     # trims the ".dll" extension if it exists in the assembly name
     if ($assemblyName.EndsWith(".dll", "OrdinalIgnoreCase")) {
@@ -157,17 +203,19 @@ function Find-ProjectFile
     foreach ($projFile in $projectFiles) {
         [xml] $xml = (Select-Xml -Path $projFile.FullName -XPath /).Node
         [string] $producedAssembly = $xml.Project.PropertyGroup.AssemblyName |
-            Where-Object { $_ -ne $null}
+            ForEach-Object { if ($_) { return $_ } }
 
-        # this is rare
+        # this is rare (occasionally, some projects may have AssemblyName defined
+        # using msbuild macro, e.g. <AssemblyName>$(RootNamespace)</AssemblyName>).
+        # not happy, but try to adapt
         [string] $ns = $xml.Project.xmlns
         if ($producedAssembly -and $producedAssembly.StartsWith('$(') -and $producedAssembly.EndsWith(')')) {
-            $path = $producedAssembly.Substring(2, $producedAssembly.Length-3)
+            $macro = $producedAssembly.Substring(2, $producedAssembly.Length-3)
             if ($ns) {
-                $producedAssembly = (Select-Xml -Xml $xml -XPath "/ns:Project//ns:$path" -Namespace @{ns=$ns}).Node.InnerText
+                $producedAssembly = (Select-Xml -Xml $xml -XPath "/ns:Project//ns:$macro" -Namespace @{ns=$ns}).Node.InnerText
             }
             else {
-                $producedAssembly = (Select-Xml -Xml $xml -XPath "/Project//$path").Node.InnerText
+                $producedAssembly = (Select-Xml -Xml $xml -XPath "/Project//$macro").Node.InnerText
             }
         }
 
@@ -181,7 +229,12 @@ function Find-ProjectFile
             }
 
             # ensure the TargetFramework matches
-            $targetFrameworksInProjFile = (Select-Xml -Xml $xml -XPath "/Project//TargetFramework | /Project//TargetFrameworks").Node.InnerText
+            if ($ns) {
+                $targetFrameworksInProjFile = (Select-Xml -Xml $xml -XPath "/ns:Project//ns:TargetFramework | /ns:Project//ns:TargetFrameworks" -Namespace @{ns=$ns}).Node.InnerText
+            }
+            else {
+                $targetFrameworksInProjFile = (Select-Xml -Xml $xml -XPath "/Project//TargetFramework | /Project//TargetFrameworks").Node.InnerText
+            }
             # $targetFrameworksInProjFile = $xml.Project.PropertyGroup.TargetFramework
             # if (-not $targetFrameworksInProjFile) {
             #     $targetFrameworksInProjFile = $xml.Project.PropertyGroup.TargetFrameworks
@@ -206,7 +259,7 @@ function Find-ProjectFile
     }
 
     # failed to find the project file matching the specified assembly
-    Write-Host -ForegroundColor Yellow "$assemblyName has no project file"
+    Write-Host -ForegroundColor Yellow "$assemblyNameWithExtension has no project file"
     $knownReferences[$assemblyName] = $null
     return $null
 }
@@ -229,13 +282,13 @@ function Test-TargetFramwork
     foreach ($tfm in $sourceTargetFrameworks.Split(";", [System.StringSplitOptions]::RemoveEmptyEntries)) {
         # tfm examples: net48;netstandard2.0;netcoreapp2.2
         # the first 4 chars are good enough to categorize them
-        $shortTargetFrameworkName = $tfm.Substring(0, 4)
+        $shortTfm = $tfm.Substring(0, 4)
 
         # a "standard" TFM can match any target framework
-        if ($shortTargetFrameworkName -eq "nets") {
+        if ($shortTfm -eq "nets") {
             return $true
         }
-        elseif ($shortTargetFrameworkName -eq $targetFramework.Substring(0, 4)) {
+        elseif ($shortTfm -eq $targetFramework.Substring(0, 4)) {
             return $true
         }
     }
@@ -333,13 +386,15 @@ function Get-ResumeList
 }
 
 <#
+.SYNOPSIS
+    Analyzes and returns the dependency list of the given project.
 #>
 function Get-DependencyList
 {
     param (
         # the project file whose reference dependency list is retrieved
         [string]   $projectFile,
-        # the base paths to folders where projects for reference dependencis are searched
+        # the base paths to folders where projects for reference dependencies are searched
         [string[]] $basePath,
         # the keyword - only the references matching the keyword are retrieved
         [string]   $keyword
@@ -362,7 +417,8 @@ function Get-DependencyList
 
         Write-Debug "Searching dependencies on $projFile"
 
-        # if the project file was added already, move it to the top of the list.
+        # if the project file was already added, move it to the bottom of the list.
+        # to refect the fact that the project appears lower in the dependency tree.
         if ($dependencyProjects.Contains($projFile)) {
             $dependencyProjects.Remove($projFile) | Out-Null
         }
@@ -408,14 +464,19 @@ function Get-DependencyList
     return $dependencyProjects
 }
 
+<#
+.SYNOPSIS
+    Build dependency projects in the order they appear in the list.
+#>
 function Build-DependencyList
 {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseApprovedVerbs', '')]
     param (
         # list of dependency projects to build
         [System.Collections.Generic.List[string]] $dependencyProjects,
         # arguments for build command
         [string] $buildArgs,
-        # if present, run nuget restore before building the project
+        # if present, run nuget restore before building each project
         [Parameter(Mandatory = $false)]
         [switch] $restore,
         # path to nuget tool (nuget.exe)
@@ -424,15 +485,16 @@ function Build-DependencyList
         # alternative command to get the project's external dependency binaries
         [Parameter(Mandatory = $false)]
         [string] $alterRestoreCommand,
+        # file to store remaining dependency list for resuming build run in case
+        # of build failure
         [Parameter(Mandatory = $true)]
         [string] $resumeFile
-
     )
 
     # cache current location for restoring from build failures
     $originalLocation = Get-Location
-
     [bool] $buildSucceeded = $true
+
     for ($i = 0; $i -lt $dependencyProjects.Count; $i++) {
         $project = $dependencyProjects[$i]
         $dir = [System.IO.Path]::GetDirectoryName($project)
@@ -486,7 +548,7 @@ if ($PSBoundParameters['Debug']) {
     $DebugPreference = 'Continue'
 }
 
-if ($restore.IsPresent) {
+if ($Restore.IsPresent) {
     $nuget = Get-NugetTool
     if (-not $nuget) {
         Write-Host -ForegroundColor Red "Restore option is specified but nuget tool is not available."
@@ -495,42 +557,45 @@ if ($restore.IsPresent) {
     }
 }
 
+# file containing dependency list for resuming run
 $resumeFile = ".\build.deps.txt"
 
-if ($resume.IsPresent) {
+if ($Resume.IsPresent) {
     Write-Debug "Resuming dependency list from $resumeFile"
     $dependencyProjects = Get-ResumeList $resumeFile
     if (-not $dependencyProjects) {
-        Write-Host -ForegroundColor Red "$resumeFile is required to resume build run."
+        Write-Host -ForegroundColor Red "Resume file $resumeFile is required to resume build run."
         exit
     }
 }
 else {
-    $watchstart = Get-Date
-    Write-Debug "Getting dependency list for project: $projectFile"
-    $dependencyProjects = Get-DependencyList $projectFile $basePath $keyword
-    $watchend = Get-Date
-    $timetaken = ([TimeSpan]($watchend-$watchstart)).TotalMinutes
-    Write-Host "Total time to complete search: $timetaken minutes."
+    $startWatch = Get-Date
+
+    Write-Debug "Getting dependency list for project: $ProjectFile"
+    $dependencyProjects = Get-DependencyList $ProjectFile $BasePath $Keyword
+
+    $endWatch = Get-Date
+    $timeElapsed = ([TimeSpan]($endWatch-$startWatch)).TotalMinutes
+    Write-Host "Total time to complete search: $timeElapsed minutes."
 }
 
-Write-Host -ForegroundColor Cyan "Building the following projects in list order:"
+Write-Host -ForegroundColor Cyan "Building the following projects (total: $($dependencyProjects.Count)) in list order:"
 $dependencyProjects
 
 # exit the script if its a dry-run
-if ($dryRun.IsPresent) {
-    if (-not $resume.IsPresent) {
+if ($DryRun.IsPresent) {
+    if (-not $Resume.IsPresent) {
         $dependencyProjects | Out-File $resumeFile
     }
     exit
 }
 
-if ($restore.IsPresent) {
+if ($Restore.IsPresent) {
     $alterRestoreCommand = "getdeps.exe"
-    Write-Debug "Buiding dependency list with: $buildArgs -restore -nugetTool $nuget -alterRestoreCommand $alterRestoreCommand -resumeFile $resumeFile"
+    Write-Debug "Buiding dependency list with: $BuildArgs -restore -nugetTool $nuget -alterRestoreCommand $alterRestoreCommand -resumeFile $resumeFile"
     Build-DependencyList $dependencyProjects $buildArgs -restore -nugetTool $nuget -alterRestoreCommand $alterRestoreCommand -resumeFile $resumeFile
 }
 else {
-    Write-Debug "Buiding dependency list with: $buildArgs -resumeFile $resumeFile"
-    Build-DependencyList $dependencyProjects $buildArgs -resumeFile $resumeFile
+    Write-Debug "Buiding dependency list with: $BuildArgs -resumeFile $resumeFile"
+    Build-DependencyList $dependencyProjects $BuildArgs -resumeFile $resumeFile
 }

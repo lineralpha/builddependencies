@@ -1,49 +1,48 @@
 @echo off
+if defined _echo echo on
+
 setlocal ENABLEDELAYEDEXPANSION
 
 REM display usage
 if "%1" == "/?" goto :usage
 if "%1" == "-?" goto :usage
 
-set restore=0
-set dryrun=0
-set resume=0
-
+REM parse arguments
 REM ===========================================================
-REM parse arguments and strip off restore and basepath
 :begin_arg_loop
 set arg=%1
 if not defined arg goto :exit_arg_loop
+
 if /i "%arg%" == "/debug" (
     set debug=1
-    goto :next
+    goto :next_arg
 )
 if /i "%arg%" == "/restore" (
     set restore=1
-    goto :next
+    goto :next_arg
 )
 if /i "%arg%" == "/dryrun" (
     set dryrun=1
-    goto :next
+    goto :next_arg
 )
 if /i "%arg%" == "/n" (
     set dryrun=1
-    goto :next
+    goto :next_arg
 )
 if /i "%arg%" == "/resume" (
     set resume=1
-    goto :next
+    goto :next_arg
 )
 if /i "%arg%" == "/basepath" (
     if "%2" == "" (
         goto :invalid_basepath
     )
     set basepath=%2 & shift /1
-    goto :next
+    goto :next_arg
 )
 set buildargs=%buildargs% %arg%
 
-:next
+:next_arg
 shift /1 & goto :begin_arg_loop
 REM ===========================================================
 
@@ -82,9 +81,9 @@ if "%debug%" == "1" (
     set switches=%switches% -debug
 )
 
-REM launch the ps script for building project
+REM launch the powershell script for building project
 echo [%~nx0] Building %projFile%
-echo powershell.exe -ExecutionPolicy bypass -File "%~dpn0.ps1" "%projFile%" %basepath% %switches% -buildArgs "%buildargs%"
+echo [%~nx0] powershell.exe -ExecutionPolicy bypass -File "%~dpn0.ps1" "%projFile%" %basepath% %switches% -buildArgs "%buildargs%"
 powershell.exe -ExecutionPolicy bypass -File "%~dpn0.ps1" "%projFile%" %basepath% %switches% -buildArgs "%buildargs%"
 
 REM return from the batch script
@@ -101,16 +100,20 @@ REM help message
 :usage
 echo.
 echo Syntax:
-echo     %~nx0 [/restore] [/dryrun | /n] [/basepath ^<source-root-path^>] [^<build-command-args^>]
+echo     %~nx0 [/dryrun ^| /n] [/resume] [/restore] [/debug] [/basepath ^<source-root-path^>] [^<build-command-args^>]
 echo.
 echo Description:
 echo     Builds a project and all projects in its dependency tree through references.
 echo.
 echo Switches:
-echo     /restore   Run nuget package restore before building the projects.
-echo.
 echo     /n or /dryrun
 echo                Dry-run the build to analyze and display dependency tree.
+echo.
+echo     /resume    Resume build run from the point where prior run stopped.
+echo.
+echo     /restore   Run nuget package restore before building the projects.
+echo.
+echo     /debug     Output debug information from the script.
 echo.
 echo     /basepath ^<source-root-path^>
 echo                Path to the base folder in the source repository where search starts.
