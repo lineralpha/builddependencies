@@ -44,11 +44,11 @@
     be built otherwise.
 
 .PARAMETER Resume
-    If present, this script resumes the build run from where it left last time
-    without needing to re-parse the dependency tree.
+    If present, this script resumes the build run from the point where it stopped
+    in previous run, without needing to re-parse the dependency tree.
 
     This can be useful and time-saving in the following two scenarios:
-    1. If DryRun is specified in a previous run, the dependency list is already
+    1. If DryRun is specified in previous run, the dependency list is already
        generated. Launching a new run with Resume specified will just pick up and
        build the existing dependency list, without re-parsing the dependency tree.
     2. If previous run failed and exited at a project, relaunching this script will
@@ -57,6 +57,13 @@
 
 .PARAMETER Restore
     If present, this script runs nuget package restore prior to building each project.
+
+    Nuget tool (nuget.exe) must be set through env:NUGET_TOOL or available via
+    env:PATH. For projects that do not use nuget packages, alternative tool (or
+    command) for getting external dependencies can be set via env:ALTER_NUGET_TOOL.
+
+    If used, both env:NUGET_TOOL and env:ALTER_NUGET_TOOL must be set before launching
+    the script.
 
 .PARAMETER BuildArgs
     If present, these are build arguments passed "as-is" to the build command.
@@ -376,6 +383,7 @@ function Get-ResumeList
         foreach ($line in [System.IO.File]::ReadLines($resumeFile)) {
             # skip empty lines (if any)
             if (-not [string]::IsNullOrWhiteSpace($line)) {
+                $line = [System.Environment]::ExpandEnvironmentVariables($line)
                 $projects.Add($line)
             }
         }
@@ -510,15 +518,15 @@ function Build-DependencyList
                 Write-Host "Running cmd.exe /c $nugetTool restore `"$project`""
                 & cmd.exe /c $nugetTool restore "$project"
             }
-            else {
+            elseif ($alterRestoreCommand) {
                 Write-Host "Running $alterRestoreCommand"
-                & $alterRestoreCommand
+                & cmd.exe /c $alterRestoreCommand
             }
         }
 
         $args = $buildArgs.Trim().Split(" ", [System.StringSplitOptions]::RemoveEmptyEntries)
         Write-Host "Running build.cmd with args: '$args'"
-        & build.cmd $args
+        & cmd.exe /c build.cmd $args
 
         if (Test-Path -Path "build*.err" -PathType Leaf) {
             Write-Host -ForegroundColor Red "Build failed in `"$dir`""
@@ -548,6 +556,14 @@ function Build-DependencyList
 if ($PSBoundParameters['Debug']) {
     $DebugPreference = 'Continue'
 }
+
+Write-Debug "ProjectFile: '$ProjectFile'"
+Write-Debug "BasePath: '$BasePath'"
+Write-Debug "Keyword: '$Keyword'"
+Write-Debug "BuildArgs: '$BuildArgs'"
+Write-Debug "DryRun: $DryRun"
+Write-Debug "Resume: $Resume"
+Write-Debug "Restore: $Restore"
 
 if ($Restore.IsPresent) {
     $nuget = Get-NugetTool
@@ -592,7 +608,7 @@ if ($DryRun.IsPresent) {
 }
 
 if ($Restore.IsPresent) {
-    $alterRestoreCommand = "getdeps.exe"
+    $alterRestoreCommand = $env:ALTER_NUGET_TOOL
     Write-Debug "Buiding dependency list with: $BuildArgs -restore -nugetTool $nuget -alterRestoreCommand $alterRestoreCommand -resumeFile $resumeFile"
     Build-DependencyList $dependencyProjects $buildArgs -restore -nugetTool $nuget -alterRestoreCommand $alterRestoreCommand -resumeFile $resumeFile
 }
